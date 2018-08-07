@@ -393,12 +393,15 @@ init_plugins(Host, ServerHost, Opts) ->
     PluginsOK = lists:foldl(
                   fun (Name, Acc) ->
                           Plugin = plugin(Host, Name),
-                          case catch apply(Plugin, init, [Host, ServerHost, Opts]) of
-                              {'EXIT', _Error} ->
-                                  Acc;
+                          try apply(Plugin, init, [Host, ServerHost, Opts]) of
                               _ ->
                                   ?DEBUG("** init ~s plugin", [Name]),
                                   [Name | Acc]
+                          catch Class:Reason ->
+                                  ?ERROR_MSG("event=init_plugin_failed "
+                                             "plugin=~p reason=~p:~p",
+                                             [Plugin, Class, Reason]),
+                                  Acc
                           end
                   end,
                   [], Plugins),
@@ -456,12 +459,17 @@ send_last_pep_items(RecipientJID, RecipientPid,
     ok.
 
 get_contacts_for_sending_last_item(RecipientPid, IgnorePepFromOffline) ->
-    case catch ejabberd_c2s:get_subscribed(RecipientPid) of
+    try ejabberd_c2s:get_subscribed(RecipientPid) of
         Contacts when is_list(Contacts) ->
             [jid:make(Contact) ||
                 Contact = {U, S, _R} <- Contacts,
                 user_resources(U, S) /= [] orelse not IgnorePepFromOffline];
         _ ->
+            []
+    catch
+        Class:Reason ->
+            ?ERROR_MSG("event=c2s_get_subscribed_failed "
+                       "reason=~p:~p", [Class, Reason]),
             []
     end.
 
@@ -826,8 +834,19 @@ remove_user(User, Server) ->
     HomeTreeBase = <<"/home/", LServer/binary, "/", LUser/binary>>,
     spawn(fun() -> lists:foreach(
                      fun(PType) ->
-                             catch remove_user_per_plugin(PType, Host, Entity, HomeTreeBase)
+                             safe_remove_user_per_plugin(PType, Host, Entity, HomeTreeBase)
                      end, plugins(Host)) end).
+
+safe_remove_user_per_plugin(PType, Host, Entity, HomeTreeBase) ->
+    try
+        remove_user_per_plugin(PType, Host, Entity, HomeTreeBase)
+    catch
+        Class:Reason ->
+              ?ERROR_MSG("event=remove_user_per_plugin_failed "
+                         "reason=~p:~p",
+                         [Class, Reason]),
+              ok
+    end.
 
 remove_user_per_plugin(PType, Host, Entity, HomeTreeBase) ->
     {result, Subs} = node_action(Host, PType, get_entity_subscriptions, [Host, Entity]),
@@ -885,9 +904,12 @@ handle_cast(_Msg, State) -> {noreply, State}.
 handle_info({route, From, To, Acc},
             #state{server_host = ServerHost, access = Access, plugins = Plugins} = State) ->
     Packet = mongoose_acc:to_element(Acc),
-    case catch do_route(ServerHost, Access, Plugins, To#jid.lserver, From, To, Packet) of
-        {'EXIT', Reason} -> ?ERROR_MSG("~p", [Reason]);
-        _ -> ok
+    try
+        do_route(ServerHost, Access, Plugins, To#jid.lserver, From, To, Packet)
+    catch
+        Class:Reason ->
+            ?ERROR_MSG("event=route_failed reason=~p:~p",
+                       [Class, Reason])
     end,
     {noreply, State};
 handle_info(_Info, State) ->
@@ -2467,9 +2489,10 @@ get_items(Host, Node, From, SubId, <<>>, ItemIds, RSM) ->
                end,
     get_items_with_limit(Host, Node, From, SubId, ItemIds, RSM, MaxItems);
 get_items(Host, Node, From, SubId, SMaxItems, ItemIds, RSM) ->
-    MaxItems = case catch binary_to_integer(SMaxItems) of
-                   {'EXIT', _} -> {error, mongoose_xmpp_errors:bad_request()};
-                   Val -> Val
+    MaxItems = try
+                   binary_to_integer(SMaxItems)
+               catch _:_ ->
+                   {error, mongoose_xmpp_errors:bad_request()}
                end,
     get_items_with_limit(Host, Node, From, SubId, ItemIds, RSM, MaxItems).
 
@@ -3685,12 +3708,12 @@ node_options(Host, Type) ->
 
 node_plugin_options(Host, Type) ->
     Module = plugin(Host, Type),
-    case catch gen_pubsub_node:options(Module) of
-        {'EXIT', {undef, _}} ->
+    try
+        gen_pubsub_node:options(Module)
+    catch
+        error:undef ->
             DefaultModule = plugin(Host, ?STDNODE),
-            gen_pubsub_node:options(DefaultModule);
-        Result ->
-            Result
+            gen_pubsub_node:options(DefaultModule)
     end.
 
 filter_node_options(Options) ->
@@ -3894,7 +3917,7 @@ add_opt(Key, Value, Opts) ->
         set_xoption(Host, Opts, add_opt(Opt, Val, NewOpts))).
 
 -define(SET_INTEGER_XOPT(Opt, Val, Min, Max),
-        case catch binary_to_integer(Val) of
+        try binary_to_integer(Val) of
             IVal when is_integer(IVal), IVal >= Min ->
                 if (Max =:= undefined) orelse (IVal =< Max) ->
                         set_xoption(Host, Opts, add_opt(Opt, IVal, NewOpts));
@@ -3902,6 +3925,9 @@ add_opt(Key, Value, Opts) ->
                         {error, mongoose_xmpp_errors:not_acceptable()}
                 end;
             _ ->
+                {error, mongoose_xmpp_errors:not_acceptable()}
+        catch
+            _:_ ->
                 {error, mongoose_xmpp_errors:not_acceptable()}
         end).
 
@@ -4063,9 +4089,10 @@ plugins(Host) ->
 config(ServerHost, Key) ->
     config(ServerHost, Key, undefined).
 config(ServerHost, Key, Default) ->
-    case catch ets:lookup(gen_mod:get_module_proc(ServerHost, config), Key) of
+    try ets:lookup(gen_mod:get_module_proc(ServerHost, config), Key) of
         [{Key, Value}] -> Value;
         _ -> Default
+    catch _:_ -> Default
     end.
 
 select_type(ServerHost, Host, Node, Type) ->
@@ -4115,9 +4142,8 @@ features() ->
 
 plugin_features(Host, Type) ->
     Module = plugin(Host, Type),
-    case catch gen_pubsub_node:features(Module) of
-        {'EXIT', {undef, _}} -> [];
-        Result -> Result
+    try gen_pubsub_node:features(Module)
+    catch error:undef -> []
     end.
 
 features(Host, <<>>) ->
@@ -4144,7 +4170,7 @@ tree_call(Host, Function, Args) ->
 tree_action(Host, Function, Args) ->
     ?DEBUG("tree_action ~p ~p ~p", [Host, Function, Args]),
     Fun = fun () -> tree_call(Host, Function, Args) end,
-    catch mnesia:sync_dirty(Fun).
+    safely:apply(fun mnesia:sync_dirty/1, [Fun]).
 
 %% @doc <p>node plugin call.</p>
 node_call(Host, Type, Function, Args) ->
@@ -4207,7 +4233,7 @@ transaction(Host, Fun, Trans) ->
 transaction_retry(_Host, _ServerHost, _Fun, _Trans, _DBType, 0) ->
     {error, mongoose_xmpp_errors:internal_server_error()};
 transaction_retry(Host, ServerHost, Fun, Trans, DBType, Count) ->
-    case catch mnesia:Trans(Fun) of
+    case safely:apply(fun mnesia:Trans/1, [Fun]) of
         {result, Result} ->
             {result, Result};
         {error, Error} ->
