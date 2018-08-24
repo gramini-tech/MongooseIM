@@ -116,7 +116,7 @@ process_iq(From, To, Acc, #iq{type = set, id = QueryId, sub_el = QueryEl} = IQ) 
             List = mod_inbox_backend:get_inbox(Username, Host, Params),
             forward_messages(List, QueryId, To),
             BinCount = integer_to_binary(length(List)),
-            Res = IQ#iq{type = result, sub_el = [build_result_iq(BinCount, BinCount, BinCount)]},
+            Res = IQ#iq{type = result, sub_el = [build_result_iq(List)]},
             {Acc, Res}
     end.
 
@@ -209,10 +209,21 @@ build_result_el(Msg, QueryId, BinUnread, Timestamp) ->
     #xmlel{name = <<"result">>, attrs = [{<<"xmlns">>, ?NS_ESL_INBOX}, {<<"unread">>, BinUnread}] ++
     QueryAttr, children = [Forwarded]}.
 
--spec build_result_iq(count_bin(), unread_bin(), active_bin()) -> exml:element().
-build_result_iq(CountBin, UnreadBin, ActiveBin) ->
+%% -spec build_result_iq(count_bin(), unread_bin(), active_bin()) -> exml:element().
+build_result_iq(List) ->
+    CountBin = integer_to_binary(length(List)),
+    Counts = [extract_unread_count(E) || E <- List],
+    Unread = lists:foldl(fun(Acc, E) -> Acc + E end, 
+                0,
+                Counts),
+    Active = lists:foldl(fun(Acc, E) -> Acc + min(E, 1) end, 
+                0,
+                Counts),
+    UnreadBin = integer_to_binary(Unread),
+    ActiveBin = integer_to_binary(Active),
+    ?ERROR_MSG("~p~n", [UnreadBin]),
     #xmlel{name = <<"fin">>, attrs = [{<<"xmlns">>, ?NS_ESL_INBOX}],
-        children = [build_result_el(<<"count">>, CountBin),
+           children = [build_result_el(<<"count">>, CountBin),
                     build_result_el(<<"unread-messages">>, UnreadBin),
                     build_result_el(<<"active-conversations">>, ActiveBin)]}.
 
@@ -435,3 +446,6 @@ is_offline_message(Msg) ->
         _ ->
             true
     end.
+
+extract_unread_count({_,_,Count,_}) ->
+    binary_to_integer(Count).
